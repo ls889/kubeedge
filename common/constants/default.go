@@ -144,5 +144,5 @@ const (
 const (
 	// ServerPort is the default port for the edgecore server on each host machine.
 	// May be overridden by a flag at startup in the future.
-	ServerPort = 10350
+	ServerPort = 10250
 )

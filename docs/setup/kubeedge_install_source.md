@@ -50,7 +50,7 @@ $GOPATH/src/github.com/kubeedge/kubeedge/build/tools/certgen.sh stream
 Run the following command on the host on which each apiserver runs:
 ** Note: ** You need to set the cloudcoreip variable first
 ```
-iptables -t nat -A OUTPUT -p tcp  --dport 10350 -j DNAT --to {cloudcoreip}:10003
+iptables -t nat -A OUTPUT -p tcp  --dport 10250 -j DNAT --to {cloudcoreip}:10003
 ```
 
 ### Compile Cloudcore
