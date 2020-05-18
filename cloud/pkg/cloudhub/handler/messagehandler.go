@@ -285,8 +285,6 @@ func (mh *MessageHandle) RegisterNode(hi hubio.CloudHubIO, info *model.HubInfo) 
 func (mh *MessageHandle) UnregisterNode(hi hubio.CloudHubIO, info *model.HubInfo, code ExitCode) {
 	mh.nodeLocks.Delete(info.NodeID)
 	mh.nodeConns.Delete(info.NodeID)
-	close(mh.KeepaliveChannel[info.NodeID])
-	delete(mh.KeepaliveChannel, info.NodeID)
 
 	err := mh.MessageQueue.Publish(constructConnectMessage(info, false))
 	if err != nil {
@@ -303,6 +301,8 @@ func (mh *MessageHandle) UnregisterNode(hi hubio.CloudHubIO, info *model.HubInfo
 	if code == nodeStop {
 		mh.MessageQueue.Close(info)
 	}
+	close(mh.KeepaliveChannel[info.NodeID])
+	delete(mh.KeepaliveChannel, info.NodeID)
 }
 
 // GetNodeCount returns the number of connected Nodes
@@ -403,17 +403,24 @@ func (mh *MessageHandle) handleMessage(nodeQueue workqueue.RateLimitingInterface
 		return
 	}
 	if msgType == "listMessage" {
-		mh.send(hi, info, msg)
+		err = mh.send(hi, info, msg)
+		if err != nil {
+			stopServe <- hubioWriteFail
+		}
 		// delete successfully sent events from the queue/store
 		nodeStore.Delete(msg)
 	} else {
-		mh.sendMsg(hi, info, msg, copyMsg, nodeStore)
+		err = mh.sendMsg(hi, info, msg, copyMsg, nodeStore)
+		if err != nil {
+			stopServe <- hubioWriteFail
+			klog.Errorf("%s", err.Error())
+		}
 	}
 
 	nodeQueue.Done(key)
 }
 
-func (mh *MessageHandle) sendMsg(hi hubio.CloudHubIO, info *model.HubInfo, msg, copyMsg *beehiveModel.Message, nodeStore cache.Store) {
+func (mh *MessageHandle) sendMsg(hi hubio.CloudHubIO, info *model.HubInfo, msg, copyMsg *beehiveModel.Message, nodeStore cache.Store) error {
 	ackChan := make(chan struct{})
 	mh.MessageAcks.Store(msg.GetID(), ackChan)
 
@@ -423,8 +430,10 @@ func (mh *MessageHandle) sendMsg(hi hubio.CloudHubIO, info *model.HubInfo, msg, 
 		retryInterval time.Duration = 5
 	)
 	ticker := time.NewTimer(retryInterval * time.Second)
-	mh.send(hi, info, msg)
-
+	err := mh.send(hi, info, msg)
+	if err != nil {
+		return err
+	}
 LOOP:
 	for {
 		select {
@@ -435,20 +444,26 @@ LOOP:
 			if retry == 4 {
 				break LOOP
 			}
-			mh.send(hi, info, msg)
+			err = mh.send(hi, info, msg)
+			if err != nil {
+				return err
+			}
 			retry++
 			ticker.Reset(time.Second * retryInterval)
 		}
 	}
+	return nil
 }
 
-func (mh *MessageHandle) send(hi hubio.CloudHubIO, info *model.HubInfo, msg *beehiveModel.Message) {
+func (mh *MessageHandle) send(hi hubio.CloudHubIO, info *model.HubInfo, msg *beehiveModel.Message) error {
 	err := mh.hubIoWrite(hi, info.NodeID, msg)
 	if err != nil {
 		klog.Errorf("write error, connection for node %s will be closed, affected event %s, reason %s",
 			info.NodeID, dumpMessageMetadata(msg), err.Error())
-		return
+		return fmt.Errorf("write error, connection for node %s will be closed, affected event %s, reason %s",
+			info.NodeID, dumpMessageMetadata(msg), err.Error())
 	}
+	return nil
 }
 
 func (mh *MessageHandle) saveSuccessPoint(msg *beehiveModel.Message, info *model.HubInfo, nodeStore cache.Store) {
