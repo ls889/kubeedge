@@ -45,6 +45,13 @@ func Run(cfg *config.CloudCoreConfig, readyzAdaptor *ReadyzAdaptor) {
 		klog.Warningf("Create Namespace kubeedge failed with error: %s", err)
 		return
 	}
+	err = TryToPatchPodReadinessGate(corev1.ConditionFalse)
+	if err != nil {
+		// Terminate the program gracefully
+		klog.Errorf("Error patching pod readinessGate to false before leaderelection: %v", err)
+		TriggerGracefulShutdown()
+	}
+
 	coreRecorder := coreBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "CloudCore"})
 	leaderElectionConfig, err := makeLeaderElectionConfig(*cfg.LeaderElection, cli, coreRecorder)
 
@@ -60,7 +67,7 @@ func Run(cfg *config.CloudCoreConfig, readyzAdaptor *ReadyzAdaptor) {
 			err := TryToPatchPodReadinessGate(corev1.ConditionTrue)
 			if err != nil {
 				// Terminate the program gracefully
-				klog.Errorf("Error patching pod readinessGate: %v", err)
+				klog.Errorf("Error patching pod readinessGate to true after becoming leader: %v", err)
 				TriggerGracefulShutdown()
 			}
 		},
@@ -68,7 +75,7 @@ func Run(cfg *config.CloudCoreConfig, readyzAdaptor *ReadyzAdaptor) {
 			err := TryToPatchPodReadinessGate(corev1.ConditionFalse)
 			if err != nil {
 				// Terminate the program gracefully
-				klog.Errorf("Error patching pod readinessGate: %v", err)
+				klog.Errorf("Error patching pod readinessGate to false after leader lost : %v", err)
 				TriggerGracefulShutdown()
 			}
 			// TODO: is it necessary to terminate the program gracefully?
