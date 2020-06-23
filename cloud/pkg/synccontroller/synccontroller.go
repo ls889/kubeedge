@@ -3,6 +3,7 @@ package synccontroller
 import (
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -10,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -29,10 +31,13 @@ import (
 	syncinformer "github.com/kubeedge/kubeedge/cloud/pkg/client/informers/externalversions/reliablesyncs/v1alpha1"
 	devicelister "github.com/kubeedge/kubeedge/cloud/pkg/client/listers/devices/v1alpha1"
 	synclister "github.com/kubeedge/kubeedge/cloud/pkg/client/listers/reliablesyncs/v1alpha1"
+	"github.com/kubeedge/kubeedge/cloud/pkg/edgecontroller/manager"
 	"github.com/kubeedge/kubeedge/cloud/pkg/synccontroller/config"
 	commonconst "github.com/kubeedge/kubeedge/common/constants"
 	configv1alpha1 "github.com/kubeedge/kubeedge/pkg/apis/componentconfig/cloudcore/v1alpha1"
 )
+
+var once sync.Once
 
 // SyncController use beehive context message layer
 type SyncController struct {
@@ -72,7 +77,8 @@ type SyncController struct {
 	objectSyncLister        synclister.ObjectSyncLister
 
 	// client
-	crdClient *versioned.Clientset
+	crdClient   *versioned.Clientset
+	nodeManager *manager.NodesManager
 }
 
 func newSyncController(enable bool) *SyncController {
@@ -86,6 +92,11 @@ func newSyncController(enable bool) *SyncController {
 
 	kubeSharedInformers := informers.NewSharedInformerFactory(kubeClient, 0)
 	crdFactory := crdinformerfactory.NewSharedInformerFactory(crdClient, 0)
+
+	nodesManager, err := manager.NewNodesManager(kubeClient, v1.NamespaceAll)
+	if err != nil {
+		klog.Fatalf("Create nodes manager failed with error: %s", err)
+	}
 
 	podInformer := kubeSharedInformers.Core().V1().Pods()
 	configMapInformer := kubeSharedInformers.Core().V1().ConfigMaps()
@@ -129,7 +140,8 @@ func newSyncController(enable bool) *SyncController {
 		clusterObjectSyncLister: clusterObjectSyncInformer.Lister(),
 		objectSyncLister:        objectSyncInformer.Lister(),
 
-		crdClient: crdClient,
+		crdClient:   crdClient,
+		nodeManager: nodesManager,
 	}
 
 	return sctl
@@ -184,6 +196,8 @@ func (sctl *SyncController) Start() {
 	}
 
 	go wait.Until(sctl.reconcile, 5*time.Second, beehiveContext.Done())
+
+	go sctl.DeleteOutdatedObjectSync()
 }
 
 func (sctl *SyncController) reconcile() {
@@ -195,7 +209,7 @@ func (sctl *SyncController) reconcile() {
 
 	allObjectSyncs, err := sctl.objectSyncLister.List(labels.Everything())
 	if err != nil {
-		klog.Errorf("Filed to list all the ObjectSyncs: %v", err)
+		klog.Errorf("Failed to list all the ObjectSyncs: %v", err)
 	}
 	sctl.manageObjectSync(allObjectSyncs)
 
@@ -212,13 +226,6 @@ func (sctl *SyncController) manageClusterObjectSync(syncs []*v1alpha1.ClusterObj
 // and generate update and delete events to the edge
 func (sctl *SyncController) manageObjectSync(syncs []*v1alpha1.ObjectSync) {
 	for _, sync := range syncs {
-		nodeName := getNodeName(sync.Name)
-		if isGarbage, err := sctl.objectSyncGarbageCollection(nodeName, sync.Namespace, sync.Name); isGarbage {
-			if err != nil {
-				klog.Errorf("objectSync GC failed, err:%v", err)
-			}
-			continue
-		}
 		switch sync.Spec.ObjectKind {
 		case model.ResourceTypePod:
 			sctl.managePod(sync)
@@ -237,26 +244,57 @@ func (sctl *SyncController) manageObjectSync(syncs []*v1alpha1.ObjectSync) {
 	}
 }
 
-// deleteObjectSync deletes the ObjectSyncs
-func (sctl *SyncController) deleteObjectSync(resourceNamespace, objectSyncName string) (err error) {
-	err = sctl.crdClient.ReliablesyncsV1alpha1().ObjectSyncs(resourceNamespace).Delete(objectSyncName, metav1.NewDeleteOptions(0))
-	return err
+// 	when CloudCore starts, it will delete outdated syncs, then triggered by node delete events.
+func (sctl *SyncController) DeleteOutdatedObjectSync() {
+	sctl.deleteObjectSyncs()
+	for {
+		select {
+		case <-beehiveContext.Done():
+			klog.Warning("Stop synccontroller DeleteOutdatedObjectSync loop")
+			return
+		case e := <-sctl.nodeManager.Events():
+			node, ok := e.Object.(*v1.Node)
+			if !ok {
+				klog.Warningf("Object type: %T unsupported", node)
+				continue
+			}
+			switch e.Type {
+			case watch.Deleted:
+				sctl.deleteObjectSyncs()
+			}
+		}
+	}
 }
 
-// objectSyncGarbageCollection checks whether objectSync needs GC and deletes it
-func (sctl *SyncController) objectSyncGarbageCollection(nodeName, namespace, objectName string) (isGarbage bool, err error) {
-	isGarbage = false
-	_, err = sctl.nodeLister.Get(nodeName)
-	if errors.IsNotFound(err) {
-		isGarbage = true
-		klog.Infof("ObjectSync %v will be deleted because node %v unregisters  ", objectName, nodeName)
-		err = sctl.deleteObjectSync(namespace, objectName)
-		if err != nil {
-			klog.Errorf("Fail to delete objectSync %v of EdgeNode %v which is offline", objectName, nodeName)
-		}
-		return isGarbage, err
+func (sctl *SyncController) deleteObjectSyncs() {
+	syncs, err := sctl.objectSyncLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("Failed to list all the ObjectSyncs: %v", err)
 	}
-	return isGarbage, err
+	for _, sync := range syncs {
+		nodeName := getNodeName(sync.Name)
+		isGarbage, err := sctl.checkObjectSync(sync)
+		if err != nil {
+			klog.Errorf("Fail to check ObjectSync outdated, %s", err)
+		}
+		if isGarbage {
+			klog.Infof("ObjectSync %v will be deleted because node %v unregisters  ", sync.Name, nodeName)
+			err = sctl.crdClient.ReliablesyncsV1alpha1().ObjectSyncs(sync.Namespace).Delete(sync.Name, metav1.NewDeleteOptions(0))
+			if err != nil {
+				klog.Errorf("Fail to delete objectSync %v of EdgeNode %v which is offline", sync.Name, nodeName)
+			}
+		}
+	}
+}
+
+// checkObjectSync checks whether objectSync is outdated
+func (sctl *SyncController) checkObjectSync(sync *v1alpha1.ObjectSync) (bool, error) {
+	nodeName := getNodeName(sync.Name)
+	_, err := sctl.nodeLister.Get(nodeName)
+	if errors.IsNotFound(err) {
+		return true, nil
+	}
+	return false, err
 }
 
 // BuildObjectSyncName builds the name of objectSync/clusterObjectSync
