@@ -11,7 +11,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -144,6 +143,12 @@ func newSyncController(enable bool) *SyncController {
 		nodeManager: nodesManager,
 	}
 
+	sctl.nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		DeleteFunc: func(obj interface{}) {
+			sctl.deleteObjectSyncs()
+		},
+	})
+
 	return sctl
 }
 
@@ -197,7 +202,7 @@ func (sctl *SyncController) Start() {
 
 	go wait.Until(sctl.reconcile, 5*time.Second, beehiveContext.Done())
 
-	go sctl.DeleteOutdatedObjectSync()
+	sctl.deleteObjectSyncs()
 }
 
 func (sctl *SyncController) reconcile() {
@@ -240,28 +245,6 @@ func (sctl *SyncController) manageObjectSync(syncs []*v1alpha1.ObjectSync) {
 		// TODO: add device here
 		default:
 			klog.Errorf("Unsupported object kind: %v", sync.Spec.ObjectKind)
-		}
-	}
-}
-
-// 	when CloudCore starts, it will delete outdated syncs, then triggered by node delete events.
-func (sctl *SyncController) DeleteOutdatedObjectSync() {
-	sctl.deleteObjectSyncs()
-	for {
-		select {
-		case <-beehiveContext.Done():
-			klog.Warning("Stop synccontroller DeleteOutdatedObjectSync loop")
-			return
-		case e := <-sctl.nodeManager.Events():
-			node, ok := e.Object.(*v1.Node)
-			if !ok {
-				klog.Warningf("Object type: %T unsupported", node)
-				continue
-			}
-			switch e.Type {
-			case watch.Deleted:
-				sctl.deleteObjectSyncs()
-			}
 		}
 	}
 }
